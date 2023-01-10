@@ -15,7 +15,7 @@ use std::{
     mem::replace,
     path::PathBuf,
     process::exit,
-    sync::mpsc::{channel, sync_channel, Receiver, SendError, SyncSender},
+    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
     thread,
 };
 
@@ -122,4 +122,171 @@ impl Shell {
 
         exit(exit_val);
     }
+}
+
+fn spawn_sig_handler(tx: Sender<WorkerMsg>) -> Result<(), DynError> {
+    // SIGTSTP、SIGINTはC-c,C-zが押されたときに終了しないために受信。大事なのはSIGCHLD
+    let mut signals = Signals::new(&[SIGINT, SIGTSTP, SIGCHLD])?;
+    thread::spawn(move || {
+        // ここでシグナルの受信を待ち受けていて、流れてきたらtxにそのままパスする
+        for sig in signals.forever() {
+            // 行き先はworker thread
+            tx.send(WorkerMsg::Signal(sig)).unwrap();
+        }
+    });
+
+    Ok(())
+}
+
+// Procから始まる以下の2つはジョブ管理用の型
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum ProcState {
+    Run,  //実行中
+    Stop, // 停止中
+}
+
+#[derive(Debug, Clone)]
+struct ProcInfo {
+    state: ProcState, // 実行状態
+    pgid: Pid,        // プロセルのグループID
+}
+
+#[derive(Debug)]
+struct Worker {
+    exit_val: i32,
+    fg: Option<Pid>,                      // フォアグラウンドのプロセスグループID
+    jobs: BTreeMap<usize, (Pid, String)>, // jobI -> (プロセスグループID,実行コマンド)
+    pgid_to_pids: HashMap<Pid, (usize, HashSet<Pid>)>, // プロセスグループId -> (ジョブID, プロセスID)
+    pid_to_info: HashMap<Pid, ProcInfo>,               // プロセスIDからプロセスグループIDへのマップ
+    shell_pgid: Pid,                                   // シェルのプロセスグループID
+}
+
+impl Worker {
+    fn new() -> Self {
+        Worker {
+            exit_val: 0,
+            fg: None, // foregroundはshell
+            jobs: BTreeMap::new(),
+            pgid_to_pids: HashMap::new(),
+            pid_to_info: HashMap::new(),
+            // shellのプロセスグループIDを取得
+            shell_pgid: tcgetpgrp(libc::STDIN_FILENO).unwrap(),
+        }
+    }
+
+    fn run_exit(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        if !self.jobs.is_empty() {
+            eprintln!("ジョブが実行中なので終了できません");
+            self.exit_val = 1;
+            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+            return true;
+        }
+
+        let exit_val = if let Some(s) = args.get(1) {
+            if let Ok(n) = (*s).parse::<i32>() {
+                n
+            } else {
+                eprintln!("{s}は不正な引数です");
+                self.exit_val = 1;
+                // shellを再開
+                shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+                return true;
+            }
+        } else {
+            self.exit_val
+        };
+
+        shell_tx.send(ShellMsg::Quit(exit_val)).unwrap();
+        true
+    }
+
+    fn run_fg(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        self.exit_val = 1;
+
+        if args.len() < 2 {
+            eprintln!("usage: fg 数字");
+            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+            return true;
+        }
+
+        if let Ok(n) = args[1].parse::<usize>() {
+            if let Some((pgid, cmd)) = self.jobs.get(&n) {
+                eprintln!("[{n}] 再開\t{cmd}");
+
+                self.fg = Some(*pgid);
+                tcsetpgrp(libc::STDIN_FILENO, *pgid).unwrap();
+
+                // ジョブを再開
+                killpg(*pgid, Signal::SIGCONT).unwrap();
+                return true;
+            }
+        }
+
+        // 失敗
+        eprintln!("{}というジョブは見つかりませんでした", args[1]);
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+        true
+    }
+
+    fn build_in_cmd(&mut self, cmd: &[(&str, Vec<&str>)], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        if cmd.len() > 1 {
+            return false; // 組み込みコマンドのパイプは非対応
+        }
+
+        match cmd[0].0 {
+            "exit" => self.run_exit(&cmd[0].1, shell_tx),
+            "jobs" => self.run_jobs(&cmd[0].1, shell_tx),
+            "fg" => self.run_fg(&cmd[0].1, shell_tx),
+            "cd" => self.run_cd(&cmd[0].1, shell_tx),
+            _ => false,
+        }
+    }
+
+    fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
+        thread::spawn(move || {
+            for msg in worker_rx.iter() {
+                match msg {
+                    WorkerMsg::Cmd(line) => {
+                        match parse_cmd(&line) {
+                            Ok(cmd) => {
+                                // shellの内部コマンドを実行する
+                                if self.build_in_cmd(&cmd, &shell_tx) {
+                                    continue; // 組み込みコマンドだったらworker_rxから受信
+                                }
+
+                                if !self.spawn_child(&line, &cmd) {
+                                    // プロセス生成失敗時はシェルから入力を再開する
+                                    shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("ltsh: {e}");
+                                shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+                            }
+                        }
+                    }
+                    // SIGCHLDシグナルを受信したときは子プロセスの状態変化を管理する
+                    WorkerMsg::Signal(SIGCHLD) => {
+                        self.wait_child(&shell_tx);
+                    }
+                    _ => (), // 無視
+                }
+            }
+        });
+    }
+}
+
+type CmdResult<'a> = Result<Vec<(&'a str, Vec<&'a str>)>, DynError>;
+
+fn parse_cmd(line: &str) -> CmdResult {
+    let commands: Vec<&str> = line.split('|').collect();
+    let result: Vec<(&str, Vec<&str>)> = commands
+        .iter()
+        .map(|cmd_and_args| {
+            let cmd_and_args = cmd_and_args.split(' ').collect::<Vec<&str>>();
+            let cmd = cmd_and_args[0];
+            (cmd, cmd_and_args)
+        })
+        .collect();
+    Ok(result)
 }
