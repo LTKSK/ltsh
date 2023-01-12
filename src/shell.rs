@@ -214,9 +214,10 @@ impl Worker {
                 eprintln!("[{n}] 再開\t{cmd}");
 
                 self.fg = Some(*pgid);
+                // ここでpgidのプロセスグループをfdの紐づくセッションのフォアグラウンドにする
                 tcsetpgrp(libc::STDIN_FILENO, *pgid).unwrap();
 
-                // ジョブを再開
+                // pgidに所属するジョブを再開
                 killpg(*pgid, Signal::SIGCONT).unwrap();
                 return true;
             }
@@ -235,11 +236,86 @@ impl Worker {
 
         match cmd[0].0 {
             "exit" => self.run_exit(&cmd[0].1, shell_tx),
-            "jobs" => self.run_jobs(&cmd[0].1, shell_tx),
+            // "jobs" => self.run_jobs(&cmd[0].1, shell_tx),
             "fg" => self.run_fg(&cmd[0].1, shell_tx),
-            "cd" => self.run_cd(&cmd[0].1, shell_tx),
+            // "cd" => self.run_cd(&cmd[0].1, shell_tx),
             _ => false,
         }
+    }
+
+    fn spawn_child(&mut self, line: &str, cmd: &[(&str, Vec<&str>)]) -> bool {
+        assert_ne!(cmd.len(), 0); // cmdが空でないことを確認
+
+        let job_id = if let Some(id) = self.get_new_job_id() {
+            id
+        } else {
+            eprintln!("ltsh: 管理可能なジョブの最大数に到達");
+            return false;
+        };
+
+        if cmd.len() > 2 {
+            eprintln!("ltsh: 3つ以上のコマンドによるパイプはサポートしていません");
+            return false;
+        }
+
+        let mut input = None; // 2つ目のプロセスのstdin
+        let mut output = None; // 1つ目のプロセスのstdout
+        if cmd.len() == 2 {
+            let p = pipe().unwrap();
+            input = Some(p.0);
+            output = Some(p.1);
+        }
+
+        let cleanup_pipe = CleanUp {
+            f: || {
+                if let Some(fd) = input {
+                    syscall(|| unistd::close(fd)).unwrap();
+                }
+                if let Some(fd) = output {
+                    syscall(|| unistd::close(fd)).unwrap();
+                }
+            },
+        };
+
+        let pgid;
+        // fork_execでプロセスを生成。Pid::from_raw(0)はでプロセスグループIDを取得している。0を渡すと生成したプロセスと同じプロセスグループIDになる
+        // コマンドの標準入出力先も渡す必要がある
+        match fork_exec(Pid::from_raw(0), cmd[0].0, &cmd[0].1, None, output) {
+            Ok(child) => {
+                pgid = child;
+            }
+            Err(e) => {
+                eprintln!("ltsh: プロセス生成エラー: {e}");
+                return false;
+            }
+        }
+
+        let info = ProcInfo {
+            state: ProcState::Run,
+            pgid,
+        };
+        let mut pids = HashMap::new();
+        pids.insert(pgid, info.clone()); //1つ目のプロセス情報
+
+        if cmd.len() == 2 {
+            match fork_exec(pgid, cmd[1].0, &cmd[1].1, input, None) {
+                Ok(child) => {
+                    pids.insert(child, info);
+                }
+                Err(e) => {
+                    eprintln!("ltsh: プロセス生成エラー: {e}");
+                    return false;
+                }
+            }
+        }
+
+        std::mem::drop(cleanup_pipe); // pipeをクローズ。これは自前でやる必要あり
+
+        self.fg = Some(pgid);
+        self.insert_job(job_id, pgid, pids, line);
+        tcsetpgrp(libc::STDIN_FILENO, pgid).unwrap();
+
+        true
     }
 
     fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
@@ -289,4 +365,20 @@ fn parse_cmd(line: &str) -> CmdResult {
         })
         .collect();
     Ok(result)
+}
+
+struct CleanUp<F>
+where
+    F: Fn(),
+{
+    f: F,
+}
+
+impl<F> Drop for CleanUp<F>
+where
+    F: Fn(),
+{
+    fn drop(&mut self) {
+        (self.f)()
+    }
 }
