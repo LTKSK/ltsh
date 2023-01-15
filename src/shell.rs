@@ -60,8 +60,7 @@ impl Shell {
         unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn).unwrap() };
 
         // Editorで標準入力を読み込んでいる
-        let mut r1 = Editor::<()>::new()?; //
-                                           // 読み込んだらまずはヒストリファイルを読み込んでいる
+        let mut r1 = Editor::<()>::new()?; // 読み込んだらまずはヒストリファイルを読み込んでいる
         if let Err(e) = r1.load_history(&self.logfile) {
             eprintln!("ltsh: ヒストリファイルの読み込みに失敗: {e}");
         }
